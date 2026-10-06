@@ -47,15 +47,16 @@ interface PendingAlbum {
 const SUPPORTED_IMAGE_TYPES: ImageMediaType[] = ["image/jpeg", "image/png", "image/gif", "image/webp"];
 // Claude rejects images over 5 MB.
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
-// Claude downscales anything with a longer edge than this, so larger photos only cost more tokens.
-const MAX_USEFUL_IMAGE_EDGE = 1568;
+// Telegram's 1280px version is plenty to recognize food; its 2560px version costs ~2.5x the
+// image tokens on current models (measured on Sonnet 5.5: ~1.8k vs ~4.7k).
+const MAX_IMAGE_EDGE = 1568;
 // Posts whose meal-type buttons still work; older ones are forgotten.
 const MAX_REMEMBERED_POSTS = 1000;
 
-/** The largest photo size Claude can use without downscaling (or the smallest if all are bigger). */
+/** The largest photo size within MAX_IMAGE_EDGE (or the smallest if all are bigger). */
 export function pickPhotoSize(sizes: PhotoSize[]): PhotoSize {
   const bySize = [...sizes].sort((a, b) => a.width * a.height - b.width * b.height);
-  const fitting = bySize.filter((s) => Math.max(s.width, s.height) <= MAX_USEFUL_IMAGE_EDGE);
+  const fitting = bySize.filter((s) => Math.max(s.width, s.height) <= MAX_IMAGE_EDGE);
   return fitting.at(-1) ?? bySize[0];
 }
 

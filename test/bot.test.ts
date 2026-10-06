@@ -3,6 +3,7 @@ import { describe, test } from "node:test";
 import type { MealAnalysis } from "../src/analyze.ts";
 import { createBot, pickPhotoSize } from "../src/bot.ts";
 import { formatMealPost, guessMealType } from "../src/format.ts";
+import { macrosMatchCalories } from "../src/nutrition.ts";
 
 const ME = 111;
 const PARTNER = 222;
@@ -127,7 +128,7 @@ function setup(analyze?: (images: any[], note?: string) => Promise<MealAnalysis>
 }
 
 describe("pickPhotoSize", () => {
-  test("picks the largest size Claude doesn't downscale", () => {
+  test("picks Telegram's 1280px version, not 2560px", () => {
     const sizes: any[] = [
       { file_id: "a", width: 90, height: 68 },
       { file_id: "b", width: 1280, height: 960 },
@@ -381,5 +382,20 @@ describe("meal type buttons", () => {
     const { t, callbackFor, botMessage } = await analyzedPost();
     await t.click(ME, callbackFor("Сніданок"), botMessage);
     assert.equal(t.callsOf("editMessageText").length, 1);
+  });
+});
+
+describe("macrosMatchCalories", () => {
+  // Real answers from a live run on Wikimedia photos.
+  test("accepts consistent estimates", () => {
+    assert.ok(macrosMatchCalories({ calories_kcal: 550, protein_g: 25, carbs_g: 45, fat_g: 30 })); // Big Mac
+    assert.ok(macrosMatchCalories({ calories_kcal: 110, protein_g: 1, carbs_g: 28, fat_g: 0 })); // banana
+    assert.ok(macrosMatchCalories({ calories_kcal: 660, protein_g: 38, carbs_g: 34, fat_g: 40 })); // full English
+    assert.ok(macrosMatchCalories({ calories_kcal: 0, protein_g: 0, carbs_g: 0, fat_g: 0 })); // cola zero
+  });
+
+  test("rejects a slipped digit", () => {
+    // Same full English, but the model wrote 378 g of carbs instead of ~38.
+    assert.equal(macrosMatchCalories({ calories_kcal: 660, protein_g: 38, carbs_g: 378, fat_g: 38 }), false);
   });
 });

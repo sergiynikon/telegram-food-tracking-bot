@@ -2,6 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { betaZodOutputFormat } from "@anthropic-ai/sdk/helpers/beta/zod";
 import { z } from "zod";
 import { config } from "./config.ts";
+import { caloriesFromMacros, macroMismatch, macrosMatchCalories } from "./nutrition.ts";
 
 const MealAnalysisSchema = z.object({
   is_food: z.boolean().describe("false if the photo does not show food or drink"),
@@ -32,14 +33,26 @@ export type ImageMediaType = "image/jpeg" | "image/png" | "image/gif" | "image/w
 const SYSTEM_PROMPT = `You are a sports nutritionist assistant. The user photographs their meals so their gym trainer can review their diet.
 Identify the food in the photo, estimate portion sizes from visual cues (plate size, utensils, hands, packaging), and estimate the nutrition of the whole portion shown.
 Account for likely hidden calories such as cooking oil, butter, dressings and sauces. If the user adds a note (weights, ingredients, how much they ate), trust it over your visual estimate.
-Round calories to the nearest 10 and grams to whole numbers. Write all human-readable text in Ukrainian.`;
+Round calories to the nearest 10 and grams to whole numbers. Before answering, check that calories ≈ 4 × protein + 4 × carbs + 9 × fat.
+Write all human-readable text in Ukrainian.`;
 
 const client = new Anthropic({ apiKey: config.anthropicApiKey });
 
-export async function analyzeMeal(
-  images: { data: string; mediaType: ImageMediaType }[],
-  userNote: string | undefined,
-): Promise<MealAnalysis> {
+type Images = { data: string; mediaType: ImageMediaType }[];
+
+export async function analyzeMeal(images: Images, userNote: string | undefined): Promise<MealAnalysis> {
+  const first = await requestAnalysis(images, userNote);
+  if (!first.is_food || macrosMatchCalories(first)) return first;
+
+  // The model occasionally slips on one number (e.g. 378 g of carbs instead of 37.8). One retry fixes it.
+  console.warn(
+    `Calories (${first.calories_kcal}) don't match macros (${caloriesFromMacros(first)} kcal from P${first.protein_g} C${first.carbs_g} F${first.fat_g}), retrying`,
+  );
+  const second = await requestAnalysis(images, userNote);
+  return macroMismatch(second) < macroMismatch(first) ? second : first;
+}
+
+async function requestAnalysis(images: Images, userNote: string | undefined): Promise<MealAnalysis> {
   const multiPhotoHint =
     images.length > 1
       ? `These ${images.length} photos show ONE meal (different angles or different parts of it). Count each food item only once and give the total for the whole meal.\n`
