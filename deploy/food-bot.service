@@ -1,0 +1,21 @@
+[Unit]
+Description=Telegram food tracking bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=foodbot
+Group=foodbot
+WorkingDirectory=/opt/food-bot
+ExecStart=/usr/bin/node src/index.ts
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/opt/food-bot
+
+[Install]
+WantedBy=multi-user.target

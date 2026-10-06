@@ -26,7 +26,7 @@ Send a meal photo → Claude estimates the dish, calories and macros → the bot
 
 - Meal type comes from the time of day (before 11:00 breakfast, 11–15 lunch, 18–23 dinner, otherwise snack). You can override it with a word in the caption (`обід`) or with the buttons under the reply (only the person who asked can press them).
 - Several photos sent together (an album) are analyzed as one meal. In groups this needs the bot to see all messages: make it a group admin.
-- Caption text (`200 г рису, без олії`) is passed to Claude to improve the estimate and is shown in the post.
+- Caption text (`200 г рису, без олії`) is passed to Claude to improve the estimate (it isn't printed in the post).
 - Only user IDs in `ALLOWED_USER_IDS` can use the bot.
 
 ## Setup
@@ -39,4 +39,22 @@ Requires Node.js 24+.
 4. `npm start`, open the bot in Telegram, and send any message. It replies with your user ID. Put it in `ALLOWED_USER_IDS`.
 5. Restart with `npm start` and send a food photo. Optionally add the bot to a group (as admin, so albums work) and use `/food` there.
 
-The bot uses long polling, so it only works while `npm start` is running. To keep it online all the time, run it on an always-on machine or a small VPS (for example with `pm2` or a systemd service).
+The bot uses long polling, so it only works while `npm start` is running. To keep it online all the time, run it on an always-on Linux machine:
+
+## Deploying on a Linux server (Debian/Ubuntu)
+
+As root, with Node.js 24+ and git installed:
+
+```bash
+useradd --system --home /opt/food-bot --shell /usr/sbin/nologin foodbot
+git clone https://github.com/sergiynikon/telegram-food-tracking-bot.git /opt/food-bot
+cd /opt/food-bot
+cp .env.example .env && chmod 600 .env   # then fill it in
+chown -R foodbot:foodbot /opt/food-bot
+runuser -u foodbot -- env HOME=/opt/food-bot npm ci --omit=dev
+install -m 644 deploy/*.service deploy/*.timer /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now food-bot food-bot-update.timer
+```
+
+`food-bot-update.timer` checks GitHub every 5 minutes and, when `main` has new commits, pulls them, reinstalls dependencies if the lock file changed, and restarts the bot. Run `bash /opt/food-bot/deploy/update.sh` to update right away. Logs: `journalctl -u food-bot` and `journalctl -u food-bot-update`.
