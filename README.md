@@ -39,6 +39,8 @@ Requires Node.js 24+.
 4. `npm start`, open the bot in Telegram, and send any message. It replies with your user ID. Put it in `ALLOWED_USER_IDS`.
 5. Restart with `npm start` and send a food photo. Optionally add the bot to a group (as admin, so albums work) and use `/food` there.
 
+`npm test` runs the bot against simulated Telegram updates (no Telegram or Claude calls). `npm run typecheck` checks types.
+
 The bot uses long polling, so it only works while `npm start` is running. To keep it online all the time, run it on an always-on Linux machine:
 
 ## Deploying on a Linux server (Debian/Ubuntu)

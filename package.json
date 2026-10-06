@@ -5,7 +5,8 @@
   "main": "src/index.ts",
   "scripts": {
     "start": "node src/index.ts",
-    "typecheck": "tsc"
+    "typecheck": "tsc",
+    "test": "node --test test/*.test.ts"
   },
   "keywords": [],
   "author": "",

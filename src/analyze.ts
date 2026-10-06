@@ -45,6 +45,7 @@ export async function analyzeMeal(
       ? `These ${images.length} photos show ONE meal (different angles or different parts of it). Count each food item only once and give the total for the whole meal.\n`
       : "";
 
+  const startedAt = Date.now();
   const response = await client.beta.messages.parse({
     model: config.claudeModel,
     max_tokens: 16000,
@@ -69,6 +70,12 @@ export async function analyzeMeal(
       },
     ],
   });
+
+  const { input_tokens, output_tokens } = response.usage;
+  console.log(
+    `Claude ${response.model} (${config.claudeEffort}): ${images.length} photo(s), ` +
+      `${input_tokens} in / ${output_tokens} out tokens, ${((Date.now() - startedAt) / 1000).toFixed(1)}s`,
+  );
 
   if (response.stop_reason === "refusal") {
     throw new Error(`Analysis was declined (${response.stop_details?.category ?? "unknown"})`);
