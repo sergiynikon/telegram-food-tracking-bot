@@ -3,6 +3,9 @@
 # Runs as root on the server: every 5 minutes via food-bot-update.timer, or by hand.
 set -euo pipefail
 
+# Wrapped in a function so bash reads the whole file before running it:
+# the merge below may rewrite this script while it runs.
+main() {
 APP_DIR=/opt/food-bot
 APP_USER=foodbot
 cd "$APP_DIR"
@@ -25,3 +28,6 @@ install -m 644 deploy/food-bot.service deploy/food-bot-update.service deploy/foo
 systemctl daemon-reload
 systemctl restart food-bot
 echo "Updated to $(as_app git log -1 --format='%h %s')"
+}
+
+main "$@"
