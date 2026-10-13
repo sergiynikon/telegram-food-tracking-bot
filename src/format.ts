@@ -13,27 +13,81 @@ export function isMealType(value: string): value is MealType {
   return value in MEAL_TYPES;
 }
 
-const CAPTION_KEYWORDS: [RegExp, MealType][] = [
-  [/сніданок|breakfast/i, "breakfast"],
-  [/обід|lunch/i, "lunch"],
-  [/перекус|snack/i, "snack"],
-  [/вечеря|dinner|supper/i, "dinner"],
-];
-
-function hourIn(date: Date, timezone: string): number {
-  return Number(new Intl.DateTimeFormat("en-GB", { hour: "numeric", hourCycle: "h23", timeZone: timezone }).format(date));
+interface WallClock {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
 }
 
-/** Meal type from a keyword in the caption, otherwise from the time of day. */
-export function guessMealType(date: Date, timezone: string, caption?: string): MealType {
-  for (const [pattern, type] of CAPTION_KEYWORDS) {
-    if (caption && pattern.test(caption)) return type;
-  }
-  const hour = hourIn(date, timezone);
+/** The date and time a clock in `timezone` shows at `date`. */
+function wallClock(date: Date, timezone: string): WallClock {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "numeric",
+    minute: "numeric",
+    hourCycle: "h23",
+    timeZone: timezone,
+  }).formatToParts(date);
+  const get = (type: string) => Number(parts.find((p) => p.type === type)!.value);
+  return { year: get("year"), month: get("month"), day: get("day"), hour: get("hour"), minute: get("minute") };
+}
+
+/** The moment a clock in `timezone` shows the given time. Day overflow (e.g. day 0) rolls over. */
+function fromWallClock(c: WallClock, timezone: string): Date {
+  const asUtc = Date.UTC(c.year, c.month - 1, c.day, c.hour, c.minute);
+  const offsetAt = (t: number) => {
+    const w = wallClock(new Date(t), timezone);
+    return Date.UTC(w.year, w.month - 1, w.day, w.hour, w.minute) - Math.floor(t / 60_000) * 60_000;
+  };
+  // Second pass corrects for a DST switch between the guess and the answer.
+  const guess = asUtc - offsetAt(asUtc);
+  return new Date(asUtc - offsetAt(guess));
+}
+
+/** Meal type from the time of day. */
+export function guessMealType(date: Date, timezone: string): MealType {
+  const { hour } = wallClock(date, timezone);
   if (hour >= 4 && hour < 11) return "breakfast";
   if (hour >= 11 && hour < 15) return "lunch";
   if (hour >= 18 && hour < 23) return "dinner";
   return "snack";
+}
+
+// A stated time this far after the message was sent is taken to mean the previous day
+// ("вечеряв о 23", sent at 00:30).
+const FUTURE_TOLERANCE_MS = 60 * 60 * 1000;
+
+/**
+ * When the meal was eaten: the time the user stated ("HH:MM", `daysAgo` days before the
+ * message), or the time the message was sent if they didn't say.
+ */
+export function resolveMealTime(sentAt: Date, eatenAt: string | null, daysAgo: number, timezone: string): Date {
+  const match = eatenAt?.match(/^(\d{1,2}):(\d{2})$/);
+  const hour = match ? Number(match[1]) : NaN;
+  const minute = match ? Number(match[2]) : NaN;
+  const validTime = hour <= 23 && minute <= 59;
+  const days = Number.isInteger(daysAgo) && daysAgo > 0 && daysAgo <= 7 ? daysAgo : 0;
+  if (!validTime && days === 0) return sentAt;
+
+  const sent = wallClock(sentAt, timezone);
+  const at = (dayShift: number) =>
+    fromWallClock(
+      {
+        ...sent,
+        day: sent.day - dayShift,
+        hour: validTime ? hour : sent.hour,
+        minute: validTime ? minute : sent.minute,
+      },
+      timezone,
+    );
+
+  const eaten = at(days);
+  if (days === 0 && eaten.getTime() - sentAt.getTime() > FUTURE_TOLERANCE_MS) return at(1);
+  return eaten;
 }
 
 function escapeHtml(text: string): string {

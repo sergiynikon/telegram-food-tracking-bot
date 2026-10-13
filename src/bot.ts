@@ -1,18 +1,19 @@
 import { Bot, InlineKeyboard, type Context } from "grammy";
 import type { Message, PhotoSize, User, UserFromGetMe } from "grammy/types";
 import type { ImageMediaType, MealAnalysis } from "./analyze.ts";
-import { formatMealPost, guessMealType, isMealType, MEAL_TYPES, type MealType } from "./format.ts";
+import { formatMealPost, guessMealType, isMealType, MEAL_TYPES, resolveMealTime, type MealType } from "./format.ts";
 
-// Private chat: every photo is analyzed and answered right there.
-// Group: only photos captioned with /food, or a /food reply to a photo, are analyzed;
-// the result is posted in the group as a reply to the photo.
+// Private chat: every photo or text description is analyzed and answered right there.
+// Group: only photos captioned with /food, "/food <description>", or a /food reply to a
+// photo or description are analyzed; the result is posted in the group as a reply.
 export const FOOD_COMMAND = "food";
 
 export interface BotOptions {
   token: string;
   allowedUserIds: Set<number>;
   timezone: string;
-  analyze: (images: { data: string; mediaType: ImageMediaType }[], userNote?: string) => Promise<MealAnalysis>;
+  /** `images` is empty when the user only described the meal in text. */
+  analyze: (images: { data: string; mediaType: ImageMediaType }[], userNote: string | undefined, sentAt: Date) => Promise<MealAnalysis>;
   /** Downloads a Telegram file as base64. Defaults to the Bot API file endpoint. */
   download?: (fileId: string) => Promise<string>;
   albumWaitMs?: number;
@@ -110,17 +111,18 @@ export function createBot(options: BotOptions) {
   });
 
   const HELP_PRIVATE = [
-    "📸 Надішліть фото їжі — я оціню калорії та БЖВ і відповім тут.",
+    "📸 Надішліть фото їжі або просто опишіть, що з'їли, — я оціню калорії та БЖВ і відповім тут.",
     "",
     "Кілька фото, надіслані разом (альбомом), рахуються як один прийом їжі.",
-    "У підписі до фото можна уточнити: вагу, склад або тип прийому їжі (сніданок, обід, перекус, вечеря).",
+    "У підписі до фото можна уточнити вагу, склад, коли ви їли й що це за прийом їжі: «снідав о 9, 200 г вівсянки».",
     "",
-    `У групі: надішліть фото з підписом /${FOOD_COMMAND} або відповідайте /${FOOD_COMMAND} на фото.`,
+    `У групі: фото з підписом /${FOOD_COMMAND}, опис після команди (/${FOOD_COMMAND} 2 яйця і тост) або /${FOOD_COMMAND} у відповідь на фото чи опис.`,
   ].join("\n");
 
   const HELP_GROUP = [
-    `📸 Надішліть фото їжі з підписом /${FOOD_COMMAND} (можна додати уточнення: /${FOOD_COMMAND} обід, 200 г рису)`,
-    `або відповідайте /${FOOD_COMMAND} на вже надіслане фото.`,
+    `📸 Надішліть фото їжі з підписом /${FOOD_COMMAND} (можна з уточненням: /${FOOD_COMMAND} обідав о 13, 200 г рису),`,
+    `опишіть страву після команди (/${FOOD_COMMAND} 2 яйця і тост з маслом)`,
+    `або відповідайте /${FOOD_COMMAND} на вже надіслане фото чи опис.`,
   ].join("\n");
 
   const UNSUPPORTED_TEXT = "Цей файл не підходить. Надішліть, будь ласка, як звичайне фото (JPEG/PNG/WebP, до 5 МБ).";
@@ -206,11 +208,14 @@ export function createBot(options: BotOptions) {
     });
   });
 
-  // "/food" sent as a reply to a photo (or in private chat without a photo).
+  // "/food <description>", or "/food" as a reply to a photo or a description.
   bot.command(FOOD_COMMAND, async (ctx) => {
-    const target = ctx.message?.reply_to_message;
+    const message = ctx.message!;
+    const args = ctx.match.trim();
+    const target = message.reply_to_message;
     const photo = target && extractPhoto(target);
-    if (!target || !photo) {
+    const targetText = target?.text?.trim();
+    if (!photo && !targetText && !args) {
       await ctx.reply(ctx.chat.type === "private" ? HELP_PRIVATE : HELP_GROUP);
       return;
     }
@@ -222,21 +227,36 @@ export function createBot(options: BotOptions) {
       await ctx.reply(UNSUPPORTED_TEXT);
       return;
     }
-    inBackground(analyzeAndReply(ctx, target, [photo], ctx.from, ctx.match.trim() || target.caption?.trim() || undefined));
+    if (photo) {
+      inBackground(analyzeAndReply(ctx, target!, [photo], ctx.from, args || target!.caption?.trim() || undefined));
+    } else if (targetText) {
+      // Description written earlier; anything after /food adds to it ("вечеряв о 20").
+      inBackground(analyzeAndReply(ctx, target!, [], ctx.from, args ? `${targetText}\n${args}` : targetText));
+    } else {
+      inBackground(analyzeAndReply(ctx, message, [], ctx.from, args));
+    }
   });
 
-  dm.on("message:text", (ctx) => ctx.reply("Надішліть фото їжі 📸"));
+  dm.on("message:text", async (ctx) => {
+    const text = ctx.message.text.trim();
+    if (text.startsWith("/")) {
+      await ctx.reply(HELP_PRIVATE);
+      return;
+    }
+    inBackground(analyzeAndReply(ctx, ctx.message, [], ctx.from, text));
+  });
 
+  /** Analyzes `photos` (or, if empty, the text `userNote`) and replies to `sourceMessage` with the result. */
   async function analyzeAndReply(
     ctx: Context,
-    photoMessage: Message,
+    sourceMessage: Message,
     photos: MealPhoto[],
     requestedBy: User,
     userNote?: string,
   ): Promise<void> {
-    const what = photos.length > 1 ? `${photos.length} фото` : "фото";
-    const status = await ctx.api.sendMessage(photoMessage.chat.id, `⏳ Аналізую ${what}…`, {
-      reply_parameters: { message_id: photoMessage.message_id },
+    const what = photos.length === 0 ? "опис" : photos.length > 1 ? `${photos.length} фото` : "фото";
+    const status = await ctx.api.sendMessage(sourceMessage.chat.id, `⏳ Аналізую ${what}…`, {
+      reply_parameters: { message_id: sourceMessage.message_id },
     });
 
     try {
@@ -244,15 +264,22 @@ export function createBot(options: BotOptions) {
         photos.map(async (photo) => ({ data: await download(photo.fileId), mediaType: photo.mediaType })),
       );
 
-      const analysis = await analyze(images, userNote);
+      const sentAt = new Date(sourceMessage.date * 1000);
+      const analysis = await analyze(images, userNote, sentAt);
       if (!analysis.is_food) {
-        await ctx.api.editMessageText(status.chat.id, status.message_id, "🤔 Не бачу їжі на фото. Спробуйте інше фото.");
+        const notFood =
+          photos.length > 0
+            ? "🤔 Не бачу їжі на фото. Спробуйте інше фото."
+            : "🤔 Не зрозумів, що ви їли. Опишіть страву, наприклад: «2 яйця, тост з маслом, кава з молоком».";
+        await ctx.api.editMessageText(status.chat.id, status.message_id, notFood);
         return;
       }
 
-      const date = new Date(photoMessage.date * 1000);
+      // The note can say when the meal was eaten ("снідав о 9") and which meal it was.
+      const date = resolveMealTime(sentAt, analysis.eaten_at, analysis.eaten_days_ago, timezone);
+      const mealType = analysis.meal_type ?? guessMealType(date, timezone);
       const id = (nextPostId++).toString(36);
-      const post: MealPost = { analysis, date, ownerId: requestedBy.id, mealType: guessMealType(date, timezone, userNote) };
+      const post: MealPost = { analysis, date, mealType, ownerId: requestedBy.id };
       posts.set(id, post);
       if (posts.size > MAX_REMEMBERED_POSTS) posts.delete(posts.keys().next().value!);
 

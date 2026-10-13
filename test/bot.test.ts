@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import type { MealAnalysis } from "../src/analyze.ts";
 import { createBot, pickPhotoSize } from "../src/bot.ts";
-import { formatMealPost, guessMealType } from "../src/format.ts";
+import { formatMealPost, guessMealType, resolveMealTime } from "../src/format.ts";
 import { macrosMatchCalories } from "../src/nutrition.ts";
 
 const ME = 111;
@@ -33,10 +33,15 @@ const MEAL: MealAnalysis = {
   fiber_g: 4,
   confidence: "medium",
   notes: "Врахована олія.",
+  meal_type: null,
+  eaten_at: null,
+  eaten_days_ago: 0,
 };
 
 // 2026-10-06 08:15 in Kyiv (breakfast time).
 const BREAKFAST_TIME = Date.UTC(2026, 9, 6, 5, 15) / 1000;
+// 2026-10-06 16:05 in Kyiv.
+const AFTERNOON_TIME = Date.UTC(2026, 9, 6, 13, 5) / 1000;
 
 const user = (id: number) => ({ id, is_bot: false, first_name: `User${id}` });
 const dmChat = (id: number) => ({ id, type: "private", first_name: `User${id}` });
@@ -44,11 +49,11 @@ const GROUP = { id: -500, type: "group", title: "Трекінг їжі" };
 
 let nextMessageId = 1;
 
-function photoMessage(opts: { from: number; chat: any; caption?: string; mediaGroupId?: string }): any {
+function photoMessage(opts: { from: number; chat: any; caption?: string; mediaGroupId?: string; date?: number }): any {
   const id = nextMessageId++;
   const message: any = {
     message_id: id,
-    date: BREAKFAST_TIME,
+    date: opts.date ?? BREAKFAST_TIME,
     chat: opts.chat,
     from: user(opts.from),
     photo: [
@@ -89,7 +94,7 @@ function documentMessage(opts: { from: number; mimeType: string; size: number })
 
 function setup(analyze?: (images: any[], note?: string) => Promise<MealAnalysis>) {
   const calls: { method: string; payload: any }[] = [];
-  const analyzeCalls: { images: any[]; note?: string }[] = [];
+  const analyzeCalls: { images: any[]; note?: string; sentAt: Date }[] = [];
   const { bot, whenIdle } = createBot({
     token: "test-token",
     allowedUserIds: new Set([ME, PARTNER]),
@@ -97,8 +102,8 @@ function setup(analyze?: (images: any[], note?: string) => Promise<MealAnalysis>
     botInfo: BOT_INFO,
     albumWaitMs: 30,
     download: async (fileId) => `base64-of-${fileId}`,
-    analyze: async (images, note) => {
-      analyzeCalls.push({ images, note });
+    analyze: async (images, note, sentAt) => {
+      analyzeCalls.push({ images, note, sentAt });
       return analyze ? analyze(images, note) : MEAL;
     },
   });
@@ -156,9 +161,50 @@ describe("guessMealType", () => {
     assert.equal(guessMealType(at(21), "Europe/Kyiv"), "snack"); // 00:15
   });
 
-  test("a keyword in the caption wins over the time", () => {
-    assert.equal(guessMealType(at(5), "Europe/Kyiv", "вечеря вчорашня"), "dinner");
-    assert.equal(guessMealType(at(17), "Europe/Kyiv", "Обід, 200 г"), "lunch");
+});
+
+describe("resolveMealTime", () => {
+  const TZ = "Europe/Kyiv";
+  const sent = new Date(AFTERNOON_TIME * 1000); // 06.10 16:05 Kyiv
+  const kyiv = (d: Date) =>
+    new Intl.DateTimeFormat("uk-UA", { dateStyle: "short", timeStyle: "short", timeZone: TZ }).format(d);
+
+  test("no stated time keeps the send time", () => {
+    assert.equal(resolveMealTime(sent, null, 0, TZ), sent);
+  });
+
+  test("a stated time earlier the same day", () => {
+    assert.equal(kyiv(resolveMealTime(sent, "13:00", 0, TZ)), "06.10.26, 13:00");
+    assert.equal(kyiv(resolveMealTime(sent, "9:30", 0, TZ)), "06.10.26, 09:30");
+  });
+
+  test("a time well after sending means the previous day", () => {
+    const afterMidnight = new Date(Date.UTC(2026, 9, 6, 21, 30)); // 07.10 00:30 Kyiv
+    assert.equal(kyiv(resolveMealTime(afterMidnight, "23:00", 0, TZ)), "06.10.26, 23:00");
+  });
+
+  test("a time slightly after sending stays on the same day", () => {
+    assert.equal(kyiv(resolveMealTime(sent, "16:30", 0, TZ)), "06.10.26, 16:30");
+  });
+
+  test("days ago, with or without a time", () => {
+    assert.equal(kyiv(resolveMealTime(sent, "20:00", 1, TZ)), "05.10.26, 20:00");
+    assert.equal(kyiv(resolveMealTime(sent, null, 2, TZ)), "04.10.26, 16:05");
+  });
+
+  test("across the switch from summer to winter time", () => {
+    // Kyiv leaves summer time (UTC+3 → UTC+2) on 25.10.2026 at 04:00.
+    const sentAfterSwitch = new Date(Date.UTC(2026, 9, 25, 8, 0)); // 25.10 10:00 UTC+2
+    const yesterday22 = resolveMealTime(sentAfterSwitch, "22:00", 1, TZ);
+    assert.equal(kyiv(yesterday22), "24.10.26, 22:00");
+    assert.equal(yesterday22.toISOString(), "2026-10-24T19:00:00.000Z"); // still UTC+3 then
+    // 02:30 that night is just before the switch, still UTC+3.
+    assert.equal(resolveMealTime(sentAfterSwitch, "02:30", 0, TZ).toISOString(), "2026-10-24T23:30:00.000Z");
+  });
+
+  test("ignores nonsense times", () => {
+    assert.equal(resolveMealTime(sent, "25:99", 0, TZ), sent);
+    assert.equal(resolveMealTime(sent, "about noon", 0, TZ), sent);
   });
 });
 
@@ -218,7 +264,7 @@ describe("private chat", () => {
   });
 
   test("an album is analyzed once, as one meal", async () => {
-    const t = setup();
+    const t = setup(async () => ({ ...MEAL, meal_type: "lunch" }));
     await t.send(photoMessage({ from: ME, chat: dmChat(ME), mediaGroupId: "album1" }));
     await t.send(photoMessage({ from: ME, chat: dmChat(ME), mediaGroupId: "album1", caption: "обід" }));
     await t.send(photoMessage({ from: ME, chat: dmChat(ME), mediaGroupId: "album1" }));
@@ -244,10 +290,54 @@ describe("private chat", () => {
     assert.equal(refusals.length, 2);
   });
 
-  test("text gets a hint instead of an analysis", async () => {
+  test("a text description is analyzed without a photo", async () => {
     const t = setup();
+    const text = textMessage({ from: ME, chat: dmChat(ME), text: "2 яйця, тост з маслом, кава з молоком" });
+    await t.send(text);
+    await t.whenIdle();
+
+    assert.equal(t.analyzeCalls.length, 1);
+    assert.deepEqual(t.analyzeCalls[0].images, []);
+    assert.equal(t.analyzeCalls[0].note, "2 яйця, тост з маслом, кава з молоком");
+    assert.equal(t.analyzeCalls[0].sentAt.getTime(), BREAKFAST_TIME * 1000);
+    const [status] = t.callsOf("sendMessage");
+    assert.equal(status.text, "⏳ Аналізую опис…");
+    assert.equal(status.reply_parameters.message_id, text.message_id);
+    assert.match(t.callsOf("editMessageText")[0].text, /#трекінг_їжі #сніданок/);
+  });
+
+  test("text that isn't about food asks for a description", async () => {
+    const t = setup(async () => ({ ...MEAL, is_food: false }));
     await t.send(textMessage({ from: ME, chat: dmChat(ME), text: "привіт" }));
-    assert.equal(t.callsOf("sendMessage")[0].text, "Надішліть фото їжі 📸");
+    await t.whenIdle();
+    assert.match(t.callsOf("editMessageText")[0].text, /Не зрозумів, що ви їли/);
+  });
+
+  test("unknown commands get the help text, not an analysis", async () => {
+    const t = setup();
+    await t.send(textMessage({ from: ME, chat: dmChat(ME), text: "/whatever" }));
+    await t.whenIdle();
+    assert.equal(t.analyzeCalls.length, 0);
+    assert.match(t.callsOf("sendMessage")[0].text, /опишіть, що з'їли/);
+  });
+
+  test("the caption sets when the meal was eaten and which meal it was", async () => {
+    // Sent at 16:05 with "снідав о 13": Claude reports the time and meal from the note.
+    const t = setup(async () => ({ ...MEAL, meal_type: "breakfast", eaten_at: "13:00" }));
+    await t.send(photoMessage({ from: ME, chat: dmChat(ME), caption: "снідав о 13", date: AFTERNOON_TIME }));
+    await t.whenIdle();
+
+    const post = t.callsOf("editMessageText")[0].text;
+    assert.match(post, /#трекінг_їжі #сніданок/);
+    assert.match(post, /Сніданок<\/b> · 06\.10\.2026, 13:00/);
+  });
+
+  test("without a stated meal, the meal type follows the stated time", async () => {
+    // Sent at 08:15 but "вчора о 20" -> yesterday 20:00 -> dinner.
+    const t = setup(async () => ({ ...MEAL, eaten_at: "20:00", eaten_days_ago: 1 }));
+    await t.send(photoMessage({ from: ME, chat: dmChat(ME), caption: "вчора о 20" }));
+    await t.whenIdle();
+    assert.match(t.callsOf("editMessageText")[0].text, /#вечеря[\s\S]*05\.10\.2026, 20:00/);
   });
 
   test("a photo without food says so", async () => {
@@ -284,7 +374,7 @@ describe("group", () => {
   });
 
   test("a photo captioned /food is analyzed and the reply goes to that photo", async () => {
-    const t = setup();
+    const t = setup(async () => ({ ...MEAL, meal_type: "lunch" }));
     const photo = photoMessage({ from: ME, chat: GROUP, caption: "/food обід, 200 г рису" });
     await t.send(photo);
     await t.whenIdle();
@@ -317,7 +407,39 @@ describe("group", () => {
     assert.equal(t.callsOf("sendMessage")[0].reply_parameters.message_id, photo.message_id);
   });
 
-  test("/food without a photo explains how to use it", async () => {
+  test("/food with a description analyzes the text and replies to the command", async () => {
+    const t = setup();
+    const command = textMessage({ from: ME, chat: GROUP, text: "/food 2 яйця і тост" });
+    await t.send(command);
+    await t.whenIdle();
+
+    assert.equal(t.analyzeCalls.length, 1);
+    assert.deepEqual(t.analyzeCalls[0].images, []);
+    assert.equal(t.analyzeCalls[0].note, "2 яйця і тост");
+    assert.equal(t.callsOf("sendMessage")[0].reply_parameters.message_id, command.message_id);
+  });
+
+  test("/food as a reply to a description analyzes it, adding anything after /food", async () => {
+    const t = setup();
+    const description = textMessage({ from: PARTNER, chat: GROUP, text: "салат цезар і кола" });
+    await t.send(textMessage({ from: PARTNER, chat: GROUP, text: "/food вечеряла о 20", replyTo: description }));
+    await t.whenIdle();
+
+    assert.equal(t.analyzeCalls.length, 1);
+    assert.deepEqual(t.analyzeCalls[0].images, []);
+    assert.equal(t.analyzeCalls[0].note, "салат цезар і кола\nвечеряла о 20");
+    assert.equal(t.callsOf("sendMessage")[0].reply_parameters.message_id, description.message_id);
+  });
+
+  test("plain text in a group is ignored", async () => {
+    const t = setup();
+    await t.send(textMessage({ from: ME, chat: GROUP, text: "2 яйця і тост" }));
+    await t.whenIdle();
+    assert.equal(t.analyzeCalls.length, 0);
+    assert.equal(t.calls.length, 0);
+  });
+
+  test("/food without a photo or description explains how to use it", async () => {
     const t = setup();
     await t.send(textMessage({ from: ME, chat: GROUP, text: "/food" }));
     assert.match(t.callsOf("sendMessage")[0].text, /підписом \/food/);

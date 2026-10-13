@@ -2,7 +2,7 @@
 
 Send a meal photo → Claude estimates the dish, calories and macros → the bot replies with a post like this:
 
-- **Private chat with the bot:** every photo gets a reply right there.
+- **Private chat with the bot:** every photo or text description gets a reply right there.
 - **Group with the bot in it:** send a photo with the caption `/food` (optionally `/food обід, 200 г рису`), or reply `/food` to a photo. The bot replies to the photo in the group.
 
 ```
@@ -24,7 +24,8 @@ Send a meal photo → Claude estimates the dish, calories and macros → the bot
 ℹ️ Оцінка ШІ, точність: середня. Врахована олія для смаження.
 ```
 
-- Meal type comes from the time of day (before 11:00 breakfast, 11–15 lunch, 18–23 dinner, otherwise snack). You can override it with a word in the caption (`обід`) or with the buttons under the reply (only the person who asked can press them).
+- No photo? Describe the meal in text instead: any message in private chat, or `/food 2 яйця і тост` (or `/food` in reply to a description) in a group.
+- The caption or description can say when and which meal it was: `снідав о 9`, `вчора ввечері`, `обідав годину тому`. Otherwise the time is when you sent it, and the meal type follows the time of day (before 11:00 breakfast, 11–15 lunch, 18–23 dinner, otherwise snack). The buttons under the reply change the meal type (only the person who asked can press them).
 - Several photos sent together (an album) are analyzed as one meal. In groups this needs the bot to see all messages: make it a group admin.
 - Caption text (`200 г рису, без олії`) is passed to Claude to improve the estimate (it isn't printed in the post).
 - Only user IDs in `ALLOWED_USER_IDS` can use the bot.
