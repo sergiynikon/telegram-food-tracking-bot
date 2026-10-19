@@ -26,6 +26,7 @@ Send a meal photo → Claude estimates the dish, calories and macros → the bot
 
 - No photo? Describe the meal in text instead: any message in private chat, or `/food 2 яйця і тост` (or `/food` in reply to a description) in a group.
 - The caption or description can say when and which meal it was: `снідав о 9`, `вчора ввечері`, `обідав годину тому`. Otherwise the time is when you sent it, and the meal type follows the time of day (before 11:00 breakfast, 11–15 lunch, 18–23 dinner, otherwise snack). The buttons under the reply change the meal type (only the person who asked can press them).
+- Reply to a result post to correct it: `додай ще половинку авокадо`, `хліба не було`, `це був обід о 14`. The bot re-estimates the meal and edits that post (✍ while working, 👌 when done, 🤷 if nothing changed). Only the person who logged the meal can correct it; anyone else replying (e.g. the trainer) is ignored. Posts are saved to `$STATE_DIRECTORY/posts.json` (`./data` locally), so buttons and corrections keep working after restarts.
 - Several photos sent together (an album) are analyzed as one meal. In groups this needs the bot to see all messages: make it a group admin.
 - Caption text (`200 г рису, без олії`) is passed to Claude to improve the estimate (it isn't printed in the post).
 - Only user IDs in `ALLOWED_USER_IDS` can use the bot.

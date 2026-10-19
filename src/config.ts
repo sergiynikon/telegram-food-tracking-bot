@@ -31,4 +31,6 @@ export const config = {
       .map(Number),
   ),
   timezone: process.env.TIMEZONE?.trim() || "Europe/Kyiv",
+  // Writable folder for saved posts: systemd's StateDirectory on the server, ./data locally.
+  stateDir: process.env.STATE_DIRECTORY?.trim() || "data",
 };

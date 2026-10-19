@@ -1,11 +1,14 @@
 import { Bot, InlineKeyboard, type Context } from "grammy";
-import type { Message, PhotoSize, User, UserFromGetMe } from "grammy/types";
+import type { Message, PhotoSize, ReactionTypeEmoji, User, UserFromGetMe } from "grammy/types";
 import type { ImageMediaType, MealAnalysis } from "./analyze.ts";
 import { formatMealPost, guessMealType, isMealType, MEAL_TYPES, resolveMealTime, type MealType } from "./format.ts";
+import { PostStore, type MealPost } from "./posts.ts";
 
 // Private chat: every photo or text description is analyzed and answered right there.
 // Group: only photos captioned with /food, "/food <description>", or a /food reply to a
 // photo or description are analyzed; the result is posted in the group as a reply.
+// Replying to a result post with a correction ("додай ще половинку авокадо") re-estimates
+// the meal and edits that post.
 export const FOOD_COMMAND = "food";
 
 export interface BotOptions {
@@ -14,6 +17,10 @@ export interface BotOptions {
   timezone: string;
   /** `images` is empty when the user only described the meal in text. */
   analyze: (images: { data: string; mediaType: ImageMediaType }[], userNote: string | undefined, sentAt: Date) => Promise<MealAnalysis>;
+  /** Re-estimates an analyzed meal with the user's correction. */
+  revise: (previous: MealAnalysis, correction: string, originalNote: string | undefined, sentAt: Date) => Promise<MealAnalysis>;
+  /** Where analyzed posts are kept; defaults to memory only. */
+  store?: PostStore;
   /** Downloads a Telegram file as base64. Defaults to the Bot API file endpoint. */
   download?: (fileId: string) => Promise<string>;
   albumWaitMs?: number;
@@ -24,13 +31,6 @@ export interface BotOptions {
 interface MealPhoto {
   fileId: string;
   mediaType: ImageMediaType;
-}
-
-interface MealPost {
-  analysis: MealAnalysis;
-  mealType: MealType;
-  date: Date;
-  ownerId: number;
 }
 
 // Photos sent together arrive as separate messages sharing a media_group_id.
@@ -51,8 +51,8 @@ const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 // Telegram's 1280px version is plenty to recognize food; its 2560px version costs ~2.5x the
 // image tokens on current models (measured on Sonnet 5.5: ~1.8k vs ~4.7k).
 const MAX_IMAGE_EDGE = 1568;
-// Posts whose meal-type buttons still work; older ones are forgotten.
-const MAX_REMEMBERED_POSTS = 1000;
+// Every result post starts with this hashtag.
+const POST_MARKER = "#трекінг_їжі";
 
 /** The largest photo size within MAX_IMAGE_EDGE (or the smallest if all are bigger). */
 export function pickPhotoSize(sizes: PhotoSize[]): PhotoSize {
@@ -62,12 +62,11 @@ export function pickPhotoSize(sizes: PhotoSize[]): PhotoSize {
 }
 
 export function createBot(options: BotOptions) {
-  const { allowedUserIds, timezone, analyze, albumWaitMs = 1500 } = options;
+  const { allowedUserIds, timezone, analyze, revise, albumWaitMs = 1500, store = new PostStore() } = options;
   const bot = new Bot(options.token, { botInfo: options.botInfo });
 
-  // In memory: after a restart the buttons on older posts stop working.
-  const posts = new Map<string, MealPost>();
-  let nextPostId = 1;
+  // Corrections to the same post run one after another, each on top of the previous one.
+  const correctionQueues = new Map<string, Promise<void>>();
   const pendingAlbums = new Map<string, PendingAlbum>();
   // Analyses running in the background, so shutdown (and tests) can wait for them.
   const running = new Set<Promise<void>>();
@@ -115,6 +114,7 @@ export function createBot(options: BotOptions) {
     "",
     "Кілька фото, надіслані разом (альбомом), рахуються як один прийом їжі.",
     "У підписі до фото можна уточнити вагу, склад, коли ви їли й що це за прийом їжі: «снідав о 9, 200 г вівсянки».",
+    "Щоб виправити оцінку, відповідайте на моє повідомлення: «додай ще половинку авокадо», «хліба не було».",
     "",
     `У групі: фото з підписом /${FOOD_COMMAND}, опис після команди (/${FOOD_COMMAND} 2 яйця і тост) або /${FOOD_COMMAND} у відповідь на фото чи опис.`,
   ].join("\n");
@@ -123,6 +123,7 @@ export function createBot(options: BotOptions) {
     `📸 Надішліть фото їжі з підписом /${FOOD_COMMAND} (можна з уточненням: /${FOOD_COMMAND} обідав о 13, 200 г рису),`,
     `опишіть страву після команди (/${FOOD_COMMAND} 2 яйця і тост з маслом)`,
     `або відповідайте /${FOOD_COMMAND} на вже надіслане фото чи опис.`,
+    "Щоб виправити оцінку, відповідайте на моє повідомлення: «додай ще половинку авокадо».",
   ].join("\n");
 
   const UNSUPPORTED_TEXT = "Цей файл не підходить. Надішліть, будь ласка, як звичайне фото (JPEG/PNG/WebP, до 5 МБ).";
@@ -208,11 +209,37 @@ export function createBot(options: BotOptions) {
     });
   });
 
+  // A reply to one of the bot's result posts is a correction to that meal.
+  bot.on("message:text", async (ctx, next) => {
+    const message = ctx.message;
+    const target = message.reply_to_message;
+    if (!target || target.from?.id !== bot.botInfo.id || message.text.startsWith("/")) return next();
+
+    const post = store.get(ctx.chat.id, target.message_id);
+    if (!post) {
+      if (!target.text?.startsWith(POST_MARKER)) return next(); // e.g. answering "describe the dish"
+      if (isAllowed(ctx.from)) {
+        await ctx.reply("Цей пост уже не можна змінити. Надішліть страву заново.", {
+          reply_parameters: { message_id: message.message_id },
+        });
+      }
+      return;
+    }
+    // Only the author corrects their meal; anyone else replying (e.g. the trainer) is just talking.
+    if (ctx.from.id !== post.ownerId) return;
+    queueCorrection(ctx, message, target.message_id, message.text.trim());
+  });
+
   // "/food <description>", or "/food" as a reply to a photo or a description.
   bot.command(FOOD_COMMAND, async (ctx) => {
     const message = ctx.message!;
     const args = ctx.match.trim();
     const target = message.reply_to_message;
+    // "/food <correction>" as a reply to a result post works like a plain reply.
+    if (target && store.get(ctx.chat.id, target.message_id)?.ownerId === ctx.from?.id && args) {
+      queueCorrection(ctx, message, target.message_id, args);
+      return;
+    }
     const photo = target && extractPhoto(target);
     const targetText = target?.text?.trim();
     if (!photo && !targetText && !args) {
@@ -237,7 +264,9 @@ export function createBot(options: BotOptions) {
     }
   });
 
-  dm.on("message:text", async (ctx) => {
+  // Registered here, after corrections and /food: `dm` filters at the point where it was created
+  // (the top), so `dm.on(...)` would run before them and swallow replies and commands.
+  bot.chatType("private").on("message:text", async (ctx) => {
     const text = ctx.message.text.trim();
     if (text.startsWith("/")) {
       await ctx.reply(HELP_PRIVATE);
@@ -278,15 +307,13 @@ export function createBot(options: BotOptions) {
       // The note can say when the meal was eaten ("снідав о 9") and which meal it was.
       const date = resolveMealTime(sentAt, analysis.eaten_at, analysis.eaten_days_ago, timezone);
       const mealType = analysis.meal_type ?? guessMealType(date, timezone);
-      const id = (nextPostId++).toString(36);
-      const post: MealPost = { analysis, date, mealType, ownerId: requestedBy.id };
-      posts.set(id, post);
-      if (posts.size > MAX_REMEMBERED_POSTS) posts.delete(posts.keys().next().value!);
+      const post: MealPost = { analysis, date, sentAt, mealType, ownerId: requestedBy.id, userNote };
 
       await ctx.api.editMessageText(status.chat.id, status.message_id, renderPost(post), {
         parse_mode: "HTML",
-        reply_markup: mealTypeKeyboard(id, post.mealType),
+        reply_markup: mealTypeKeyboard(post.mealType),
       });
+      store.set(status.chat.id, status.message_id, post);
     } catch (err) {
       console.error("Meal analysis failed:", err);
       await ctx.api
@@ -299,25 +326,89 @@ export function createBot(options: BotOptions) {
     return formatMealPost({ ...post, timezone });
   }
 
-  function mealTypeKeyboard(id: string, selected: MealType): InlineKeyboard {
+  function mealTypeKeyboard(selected: MealType): InlineKeyboard {
     const keyboard = new InlineKeyboard();
     for (const [type, meal] of Object.entries(MEAL_TYPES)) {
-      keyboard.text(`${type === selected ? "✅ " : ""}${meal.label}`, `meal:${id}:${type}`);
+      keyboard.text(`${type === selected ? "✅ " : ""}${meal.label}`, `meal:${type}`);
     }
     return keyboard;
   }
 
-  bot.callbackQuery(/^meal:(\w+):(\w+)$/, async (ctx) => {
-    const [, id, type] = ctx.match;
-    const post = posts.get(id);
-    if (!post || !isMealType(type)) return ctx.answerCallbackQuery("Цей пост уже не можна змінити.");
+  // The post is found by the message the button is on. Also accepts the older "meal:<id>:<type>".
+  bot.callbackQuery(/^meal:(?:\w+:)?(\w+)$/, async (ctx) => {
+    const type = ctx.match[1];
+    const message = ctx.callbackQuery.message;
+    const post = message && store.get(message.chat.id, message.message_id);
+    if (!message || !post || !isMealType(type)) return ctx.answerCallbackQuery("Цей пост уже не можна змінити.");
     if (ctx.from.id !== post.ownerId) return ctx.answerCallbackQuery("Змінити може лише автор фото.");
     if (post.mealType !== type) {
-      post.mealType = type;
-      await ctx.editMessageText(renderPost(post), { parse_mode: "HTML", reply_markup: mealTypeKeyboard(id, type) });
+      const updated = { ...post, mealType: type };
+      await ctx.editMessageText(renderPost(updated), { parse_mode: "HTML", reply_markup: mealTypeKeyboard(type) });
+      store.set(message.chat.id, message.message_id, updated);
     }
     await ctx.answerCallbackQuery();
   });
+
+  function react(message: Message, emoji?: ReactionTypeEmoji["emoji"]): Promise<unknown> {
+    // Reactions can be turned off in a group; they're only a progress hint, so ignore failures.
+    return bot.api
+      .setMessageReaction(message.chat.id, message.message_id, emoji ? [{ type: "emoji", emoji }] : [])
+      .catch(() => {});
+  }
+
+  function queueCorrection(ctx: Context, correction: Message, postMessageId: number, text: string): void {
+    const key = `${correction.chat.id}:${postMessageId}`;
+    const task = (correctionQueues.get(key) ?? Promise.resolve()).then(() =>
+      reviseAndEdit(ctx, correction, postMessageId, text),
+    );
+    correctionQueues.set(key, task);
+    inBackground(task.finally(() => correctionQueues.get(key) === task && correctionQueues.delete(key)));
+  }
+
+  /** Re-estimates the meal in post `postMessageId` with the user's correction and edits the post. */
+  async function reviseAndEdit(ctx: Context, correction: Message, postMessageId: number, text: string): Promise<void> {
+    const chatId = correction.chat.id;
+    const post = store.get(chatId, postMessageId);
+    if (!post) return;
+    await react(correction, "✍");
+
+    try {
+      const revised = await revise(post.analysis, text, post.userNote, post.sentAt);
+      const updated = applyRevision(post, revised);
+      if (!revised.is_food || renderPost(updated) === renderPost(post)) {
+        await react(correction, "🤷");
+        return;
+      }
+      await ctx.api.editMessageText(chatId, postMessageId, renderPost(updated), {
+        parse_mode: "HTML",
+        reply_markup: mealTypeKeyboard(updated.mealType),
+      });
+      store.set(chatId, postMessageId, updated);
+      await react(correction, "👌");
+    } catch (err) {
+      console.error("Meal correction failed:", err);
+      await react(correction);
+      await ctx.api
+        .sendMessage(chatId, "❌ Не вдалося перерахувати. Спробуйте ще раз.", {
+          reply_parameters: { message_id: correction.message_id },
+        })
+        .catch(() => {});
+    }
+  }
+
+  /**
+   * The post after a correction. Time and meal type only change if the correction changed them:
+   * a meal type picked with the buttons survives "додай ще авокадо".
+   */
+  function applyRevision(post: MealPost, revised: MealAnalysis): MealPost {
+    const previous = post.analysis;
+    const timeChanged = revised.eaten_at !== previous.eaten_at || revised.eaten_days_ago !== previous.eaten_days_ago;
+    const date = timeChanged ? resolveMealTime(post.sentAt, revised.eaten_at, revised.eaten_days_ago, timezone) : post.date;
+    let mealType = post.mealType;
+    if (revised.meal_type && revised.meal_type !== previous.meal_type) mealType = revised.meal_type;
+    else if (timeChanged && !revised.meal_type) mealType = guessMealType(date, timezone);
+    return { ...post, analysis: revised, date, mealType };
+  }
 
   bot.catch((err) => console.error("Unhandled bot error:", err.error));
 

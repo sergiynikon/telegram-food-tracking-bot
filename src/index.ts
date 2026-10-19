@@ -1,12 +1,16 @@
-import { analyzeMeal } from "./analyze.ts";
+import { join } from "node:path";
+import { analyzeMeal, reviseMeal } from "./analyze.ts";
 import { createBot, FOOD_COMMAND } from "./bot.ts";
 import { config } from "./config.ts";
+import { PostStore } from "./posts.ts";
 
 const { bot, whenIdle } = createBot({
   token: config.telegramToken,
   allowedUserIds: config.allowedUserIds,
   timezone: config.timezone,
   analyze: analyzeMeal,
+  revise: reviseMeal,
+  store: new PostStore(join(config.stateDir, "posts.json")),
 });
 
 await bot.api.setMyCommands([{ command: "start", description: "Як користуватися ботом" }], {

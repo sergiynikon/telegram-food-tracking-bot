@@ -54,10 +54,55 @@ Write all human-readable text in Ukrainian.`;
 const client = new Anthropic({ apiKey: config.anthropicApiKey });
 
 type Images = { data: string; mediaType: ImageMediaType }[];
+type Content = Anthropic.Beta.BetaContentBlockParam[];
+
+function localTime(date: Date): string {
+  return new Intl.DateTimeFormat("uk-UA", { dateStyle: "full", timeStyle: "short", timeZone: config.timezone }).format(date);
+}
 
 /** Analyzes a meal from photos, a text description, or both (`images` may be empty). */
 export async function analyzeMeal(images: Images, userNote: string | undefined, sentAt: Date): Promise<MealAnalysis> {
-  const request = () => requestAnalysis(images, userNote, sentAt);
+  const lines = [`Message sent: ${localTime(sentAt)}.`];
+  if (images.length === 0) {
+    lines.push("No photo: estimate from the description only.");
+  } else if (images.length > 1) {
+    lines.push(
+      `These ${images.length} photos show ONE meal (different angles or different parts of it). Count each food item only once and give the total for the whole meal.`,
+    );
+  }
+  lines.push(userNote ? `Note from the user: ${userNote}` : "Estimate the nutrition of this meal.");
+
+  const content: Content = [
+    ...images.map((image) => ({
+      type: "image" as const,
+      source: { type: "base64" as const, media_type: image.mediaType, data: image.data },
+    })),
+    { type: "text", text: lines.join("\n") },
+  ];
+  return withMacroCheck(() => requestAnalysis(content, `${images.length} photo(s)`));
+}
+
+/**
+ * Updates an earlier analysis with the user's correction ("додай ще половинку авокадо",
+ * "хліба не було", "це був обід о 14"). The photos aren't sent again: the previous analysis
+ * already describes them.
+ */
+export async function reviseMeal(
+  previous: MealAnalysis,
+  correction: string,
+  originalNote: string | undefined,
+  sentAt: Date,
+): Promise<MealAnalysis> {
+  const lines = [
+    `Message sent: ${localTime(sentAt)}.`,
+    "You already analyzed this meal and the user now sends a correction. Return the full updated analysis: apply the correction (add, remove or change items and portions, or the time or meal if they mention it) and keep everything else as it was, including meal_type, eaten_at and eaten_days_ago unless the correction changes them. If the message changes nothing about the meal, return the previous analysis unchanged.",
+  ];
+  if (originalNote) lines.push(`Original note from the user: ${originalNote}`);
+  lines.push(`Previous analysis: ${JSON.stringify(previous)}`, `Correction from the user: ${correction}`);
+  return withMacroCheck(() => requestAnalysis([{ type: "text", text: lines.join("\n") }], "correction"));
+}
+
+async function withMacroCheck(request: () => Promise<MealAnalysis>): Promise<MealAnalysis> {
   const first = await request();
   if (!first.is_food || macrosMatchCalories(first)) return first;
 
@@ -69,18 +114,7 @@ export async function analyzeMeal(images: Images, userNote: string | undefined, 
   return macroMismatch(second) < macroMismatch(first) ? second : first;
 }
 
-async function requestAnalysis(images: Images, userNote: string | undefined, sentAt: Date): Promise<MealAnalysis> {
-  const sentLocal = new Intl.DateTimeFormat("uk-UA", { dateStyle: "full", timeStyle: "short", timeZone: config.timezone }).format(sentAt);
-  const lines = [`Message sent: ${sentLocal}.`];
-  if (images.length === 0) {
-    lines.push("No photo: estimate from the description only.");
-  } else if (images.length > 1) {
-    lines.push(
-      `These ${images.length} photos show ONE meal (different angles or different parts of it). Count each food item only once and give the total for the whole meal.`,
-    );
-  }
-  lines.push(userNote ? `Note from the user: ${userNote}` : "Estimate the nutrition of this meal.");
-
+async function requestAnalysis(content: Content, label: string): Promise<MealAnalysis> {
   const startedAt = Date.now();
   const response = await client.beta.messages.parse({
     model: config.claudeModel,
@@ -90,23 +124,12 @@ async function requestAnalysis(images: Images, userNote: string | undefined, sen
     betas: ["server-side-fallback-2026-07-01"],
     fallbacks: "default",
     system: SYSTEM_PROMPT,
-    messages: [
-      {
-        role: "user",
-        content: [
-          ...images.map((image) => ({
-            type: "image" as const,
-            source: { type: "base64" as const, media_type: image.mediaType, data: image.data },
-          })),
-          { type: "text", text: lines.join("\n") },
-        ],
-      },
-    ],
+    messages: [{ role: "user", content }],
   });
 
   const { input_tokens, output_tokens } = response.usage;
   console.log(
-    `Claude ${response.model} (${config.claudeEffort}): ${images.length} photo(s), ` +
+    `Claude ${response.model} (${config.claudeEffort}): ${label}, ` +
       `${input_tokens} in / ${output_tokens} out tokens, ${((Date.now() - startedAt) / 1000).toFixed(1)}s`,
   );
 

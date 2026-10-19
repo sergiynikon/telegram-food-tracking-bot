@@ -4,11 +4,16 @@ import type { MealAnalysis } from "../src/analyze.ts";
 import { createBot, pickPhotoSize } from "../src/bot.ts";
 import { formatMealPost, guessMealType, resolveMealTime } from "../src/format.ts";
 import { macrosMatchCalories } from "../src/nutrition.ts";
+import { PostStore } from "../src/posts.ts";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const ME = 111;
 const PARTNER = 222;
 const TRAINER = 333;
 
+const BOT_USER = { id: 999, is_bot: true, first_name: "Food Tracking Bot", username: "sn_foodtrackingbot" };
 const BOT_INFO: any = {
   id: 999,
   is_bot: true,
@@ -92,19 +97,30 @@ function documentMessage(opts: { from: number; mimeType: string; size: number })
   };
 }
 
-function setup(analyze?: (images: any[], note?: string) => Promise<MealAnalysis>) {
+type Revise = (previous: MealAnalysis, correction: string) => Promise<MealAnalysis>;
+
+function setup(
+  analyze?: (images: any[], note?: string) => Promise<MealAnalysis>,
+  opts: { revise?: Revise; store?: PostStore } = {},
+) {
   const calls: { method: string; payload: any }[] = [];
   const analyzeCalls: { images: any[]; note?: string; sentAt: Date }[] = [];
+  const reviseCalls: { previous: MealAnalysis; correction: string; originalNote?: string; sentAt: Date }[] = [];
   const { bot, whenIdle } = createBot({
     token: "test-token",
     allowedUserIds: new Set([ME, PARTNER]),
     timezone: "Europe/Kyiv",
     botInfo: BOT_INFO,
     albumWaitMs: 30,
+    store: opts.store,
     download: async (fileId) => `base64-of-${fileId}`,
     analyze: async (images, note, sentAt) => {
       analyzeCalls.push({ images, note, sentAt });
       return analyze ? analyze(images, note) : MEAL;
+    },
+    revise: async (previous, correction, originalNote, sentAt) => {
+      reviseCalls.push({ previous, correction, originalNote, sentAt });
+      return opts.revise ? opts.revise(previous, correction) : previous;
     },
   });
 
@@ -129,7 +145,18 @@ function setup(analyze?: (images: any[], note?: string) => Promise<MealAnalysis>
     } as any);
   };
   const callsOf = (method: string) => calls.filter((c) => c.method === method).map((c) => c.payload);
-  return { send, click, whenIdle, calls, callsOf, analyzeCalls };
+  /** The bot's result post as a Telegram message (from its first edit), to reply to or click on. */
+  const resultPost = () => {
+    const edit = callsOf("editMessageText")[0];
+    const chat = edit.chat_id < 0 ? GROUP : dmChat(edit.chat_id);
+    return { message_id: edit.message_id, date: BREAKFAST_TIME, chat, from: BOT_USER, text: edit.text, reply_markup: edit.reply_markup };
+  };
+  /** Emoji reactions the bot set on a message, in order ("" = cleared). */
+  const reactionsOn = (messageId: number) =>
+    callsOf("setMessageReaction")
+      .filter((r) => r.message_id === messageId)
+      .map((r) => r.reaction[0]?.emoji ?? "");
+  return { send, click, whenIdle, calls, callsOf, analyzeCalls, reviseCalls, resultPost, reactionsOn };
 }
 
 describe("pickPhotoSize", () => {
@@ -520,4 +547,188 @@ describe("macrosMatchCalories", () => {
     // Same full English, but the model wrote 378 g of carbs instead of ~38.
     assert.equal(macrosMatchCalories({ calories_kcal: 660, protein_g: 38, carbs_g: 378, fat_g: 38 }), false);
   });
+});
+
+describe("corrections (replying to a result post)", () => {
+  const WITH_AVOCADO: MealAnalysis = {
+    ...MEAL,
+    items: [...MEAL.items, { name: "Авокадо", portion: "½ шт (~70 г)" }],
+    calories_kcal: 560,
+    protein_g: 27,
+    carbs_g: 36,
+    fat_g: 32,
+  };
+
+  async function analyzedMeal(chat: any, opts: Parameters<typeof setup>[1] = {}) {
+    const t = setup(undefined, opts);
+    await t.send(photoMessage({ from: ME, chat, caption: chat.type === "private" ? "омлет" : "/food омлет" }));
+    await t.whenIdle();
+    return { t, post: t.resultPost() };
+  }
+
+  test("re-estimates the meal and edits the replied post in place", async () => {
+    const { t, post } = await analyzedMeal(dmChat(ME), { revise: async () => WITH_AVOCADO });
+    const reply = textMessage({ from: ME, chat: dmChat(ME), text: "додай ще половинку авокадо", replyTo: post });
+    await t.send(reply);
+    await t.whenIdle();
+
+    assert.equal(t.analyzeCalls.length, 1, "no new meal is created");
+    assert.equal(t.reviseCalls.length, 1);
+    assert.deepEqual(t.reviseCalls[0].previous, MEAL);
+    assert.equal(t.reviseCalls[0].correction, "додай ще половинку авокадо");
+    assert.equal(t.reviseCalls[0].originalNote, "омлет");
+    assert.equal(t.reviseCalls[0].sentAt.getTime(), BREAKFAST_TIME * 1000);
+
+    const edits = t.callsOf("editMessageText");
+    assert.equal(edits.length, 2);
+    assert.equal(edits[1].message_id, post.message_id, "the same post is edited");
+    assert.match(edits[1].text, /~560 ккал/);
+    assert.match(edits[1].text, /Авокадо — ½ шт/);
+    assert.doesNotMatch(edits[1].text, /додай/, "the correction itself isn't printed");
+    assert.equal(t.callsOf("sendMessage").length, 1, "only the original status message, no chatter");
+    assert.deepEqual(t.reactionsOn(reply.message_id), ["✍", "👌"]);
+  });
+
+  test("works in a group too, also as /food <correction>", async () => {
+    const { t, post } = await analyzedMeal(GROUP, { revise: async () => WITH_AVOCADO });
+    await t.send(textMessage({ from: ME, chat: GROUP, text: "/food додай авокадо", replyTo: post }));
+    await t.whenIdle();
+    assert.equal(t.reviseCalls[0]?.correction, "додай авокадо");
+    assert.match(t.callsOf("editMessageText")[1].text, /~560 ккал/);
+  });
+
+  test("replies from anyone but the author are ignored (e.g. the trainer commenting)", async () => {
+    const { t, post } = await analyzedMeal(GROUP, { revise: async () => WITH_AVOCADO });
+    await t.send(textMessage({ from: TRAINER, chat: GROUP, text: "менше хліба!", replyTo: post }));
+    await t.send(textMessage({ from: PARTNER, chat: GROUP, text: "додай авокадо", replyTo: post }));
+    await t.whenIdle();
+    assert.equal(t.reviseCalls.length, 0);
+    assert.equal(t.callsOf("editMessageText").length, 1);
+    assert.equal(t.callsOf("setMessageReaction").length, 0);
+    assert.equal(t.callsOf("sendMessage").length, 1);
+  });
+
+  test("a reply that changes nothing gets 🤷 and no edit", async () => {
+    const { t, post } = await analyzedMeal(dmChat(ME)); // revise returns the previous analysis
+    const reply = textMessage({ from: ME, chat: dmChat(ME), text: "дякую", replyTo: post });
+    await t.send(reply);
+    await t.whenIdle();
+    assert.equal(t.callsOf("editMessageText").length, 1);
+    assert.deepEqual(t.reactionsOn(reply.message_id), ["✍", "🤷"]);
+  });
+
+  test("a correction can move the meal time; the meal type then follows the new time", async () => {
+    // Sent at 08:15 (breakfast); the correction moves it to yesterday 13:30.
+    const { t, post } = await analyzedMeal(dmChat(ME), {
+      revise: async (prev) => ({ ...prev, eaten_at: "13:30", eaten_days_ago: 1 }),
+    });
+    await t.send(textMessage({ from: ME, chat: dmChat(ME), text: "це було вчора о пів на другу", replyTo: post }));
+    await t.whenIdle();
+    const edited = t.callsOf("editMessageText")[1].text;
+    assert.match(edited, /#трекінг_їжі #обід/);
+    assert.match(edited, /05\.10\.2026, 13:30/);
+  });
+
+  test("a meal type picked with the buttons survives a correction that doesn't mention it", async () => {
+    const { t, post } = await analyzedMeal(dmChat(ME), { revise: async () => WITH_AVOCADO });
+    const dinner = post.reply_markup.inline_keyboard.flat().find((b: any) => b.text.endsWith("Вечеря")).callback_data;
+    await t.click(ME, dinner, post);
+    await t.send(textMessage({ from: ME, chat: dmChat(ME), text: "додай авокадо", replyTo: post }));
+    await t.whenIdle();
+    assert.match(t.callsOf("editMessageText").at(-1).text, /#вечеря[\s\S]*~560 ккал/);
+  });
+
+  test("quick successive corrections build on each other", async () => {
+    const { t, post } = await analyzedMeal(dmChat(ME), {
+      // Slow enough that the second reply arrives while the first is still being estimated.
+      revise: async (prev, correction) => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return { ...prev, calories_kcal: prev.calories_kcal + 100, notes: correction };
+      },
+    });
+    await t.send(textMessage({ from: ME, chat: dmChat(ME), text: "+1", replyTo: post }));
+    await t.send(textMessage({ from: ME, chat: dmChat(ME), text: "+2", replyTo: post }));
+    await t.whenIdle();
+    assert.equal(t.reviseCalls[1].previous.calories_kcal, 552, "the second correction sees the first one's result");
+    assert.match(t.callsOf("editMessageText").at(-1).text, /~652 ккал/);
+  });
+
+  test("a failed correction says so and clears the ✍", async () => {
+    const { t, post } = await analyzedMeal(dmChat(ME), {
+      revise: async () => {
+        throw new Error("API down");
+      },
+    });
+    const reply = textMessage({ from: ME, chat: dmChat(ME), text: "додай авокадо", replyTo: post });
+    const originalError = console.error;
+    console.error = () => {};
+    try {
+      await t.send(reply);
+      await t.whenIdle();
+    } finally {
+      console.error = originalError;
+    }
+    assert.deepEqual(t.reactionsOn(reply.message_id), ["✍", ""]);
+    assert.match(t.callsOf("sendMessage").at(-1).text, /Не вдалося перерахувати/);
+  });
+
+  test("answering the bot's 'describe the dish' message is a new description, not a correction", async () => {
+    const t = setup(async (_images, note) => (note === "привіт" ? { ...MEAL, is_food: false } : MEAL));
+    await t.send(textMessage({ from: ME, chat: dmChat(ME), text: "привіт" }));
+    await t.whenIdle();
+    const question = t.resultPost(); // "🤔 Не зрозумів, що ви їли…"
+    await t.send(textMessage({ from: ME, chat: dmChat(ME), text: "2 яйця і тост", replyTo: question }));
+    await t.whenIdle();
+    assert.equal(t.analyzeCalls.length, 2);
+    assert.equal(t.analyzeCalls[1].note, "2 яйця і тост");
+    assert.equal(t.reviseCalls.length, 0);
+  });
+
+  test("a post the bot no longer remembers can't be corrected", async () => {
+    const t = setup();
+    const oldPost = { message_id: 42, date: BREAKFAST_TIME, chat: dmChat(ME), from: BOT_USER, text: "#трекінг_їжі #обід\n…" };
+    await t.send(textMessage({ from: ME, chat: dmChat(ME), text: "додай авокадо", replyTo: oldPost }));
+    await t.whenIdle();
+    assert.equal(t.analyzeCalls.length, 0, "not mistaken for a new meal");
+    assert.match(t.callsOf("sendMessage")[0].text, /уже не можна змінити/);
+  });
+});
+
+describe("saved posts", () => {
+  test("buttons and corrections keep working after a restart", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "food-bot-"));
+    try {
+      const file = join(dir, "posts.json");
+      const before = setup(undefined, { store: new PostStore(file) });
+      await before.send(photoMessage({ from: ME, chat: dmChat(ME), caption: "омлет" }));
+      await before.whenIdle();
+      const post = before.resultPost();
+
+      // "Restart": a new bot reading the same file.
+      const after = setup(undefined, {
+        store: new PostStore(file),
+        revise: async (prev) => ({ ...prev, calories_kcal: 600, protein_g: 30, carbs_g: 40, fat_g: 34 }),
+      });
+      const lunch = post.reply_markup.inline_keyboard.flat().find((b: any) => b.text.endsWith("Обід")).callback_data;
+      await after.click(ME, lunch, post);
+      await after.send(textMessage({ from: ME, chat: dmChat(ME), text: "більше сиру", replyTo: post }));
+      await after.whenIdle();
+
+      assert.equal(after.reviseCalls[0].originalNote, "омлет");
+      assert.equal(after.reviseCalls[0].sentAt.getTime(), BREAKFAST_TIME * 1000, "dates survive the round trip");
+      const edits = after.callsOf("editMessageText");
+      assert.equal(edits.length, 2);
+      assert.match(edits[1].text, /#обід[\s\S]*~600 ккал/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+test("/food <description> in private chat is analyzed, not answered with help", async () => {
+  const t = setup();
+  await t.send(textMessage({ from: ME, chat: dmChat(ME), text: "/food 2 яйця і тост" }));
+  await t.whenIdle();
+  assert.equal(t.analyzeCalls.length, 1);
+  assert.equal(t.analyzeCalls[0].note, "2 яйця і тост");
 });

@@ -16,6 +16,8 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ReadOnlyPaths=/opt/food-bot
+# /var/lib/food-bot (passed as $STATE_DIRECTORY): saved posts, so buttons and corrections survive restarts.
+StateDirectory=food-bot
 
 [Install]
 WantedBy=multi-user.target
